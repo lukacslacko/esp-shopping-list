@@ -15,6 +15,7 @@
 #include "esp_sntp.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
+#include "esp_timer.h"
 
 #include "api.h"
 
@@ -35,6 +36,7 @@ static const char *TAG = "main";
 #define REC_MAX_SEC     5
 #define REC_BUFFER_SAMPLES (SAMPLE_RATE * REC_MAX_SEC)
 #define MIN_REC_SAMPLES (SAMPLE_RATE / 2)  // 0.5 seconds minimum
+#define TOAST_DURATION_MS 8000
 
 // ---------------------------------------------------------------------
 // Globals
@@ -50,16 +52,15 @@ static volatile bool is_recording = false;
 static volatile bool wifi_connected = false;
 
 // UI widgets
-static lv_obj_t *time_label = NULL;
+static lv_obj_t *clock_label = NULL;
 static lv_obj_t *wifi_indicator = NULL;
-static lv_obj_t *status_label = NULL;
+static lv_obj_t *toast_label = NULL;
+static lv_obj_t *toast_bar = NULL;
 static lv_obj_t *record_btn = NULL;
 static lv_obj_t *record_btn_label = NULL;
-static lv_obj_t *list_container = NULL;
 
-// Task list (stored with IDs for completing)
-static todoist_task_t *task_list = NULL;
-static int task_count = 0;
+// Toast auto-clear
+static int64_t toast_show_time = 0;
 
 // ---------------------------------------------------------------------
 // WiFi Event Handler
@@ -112,111 +113,15 @@ static void audio_task(void *pvParameters)
 // ---------------------------------------------------------------------
 // UI Helpers
 // ---------------------------------------------------------------------
-static void set_status(const char *text)
+static void show_toast(const char *text)
 {
-    if (status_label) {
-        lv_label_set_text(status_label, text);
+    if (toast_label) {
+        lv_label_set_text(toast_label, text);
     }
-}
-
-static void free_task_list(void)
-{
-    if (task_list) {
-        for (int i = 0; i < task_count; i++) {
-            free(task_list[i].id);
-            free(task_list[i].content);
-        }
-        free(task_list);
-        task_list = NULL;
+    if (toast_bar) {
+        lv_obj_remove_flag(toast_bar, LV_OBJ_FLAG_HIDDEN);
     }
-    task_count = 0;
-}
-
-static void task_item_click_cb(lv_event_t *e);
-
-static void refresh_list_ui(void)
-{
-    if (!list_container) return;
-
-    lv_obj_clean(list_container);
-
-    if (task_count == 0) {
-        lv_obj_t *empty = lv_label_create(list_container);
-        lv_label_set_text(empty, "No items. Hold button to add.");
-        lv_obj_set_style_text_color(empty, lv_color_hex(0x888888), 0);
-        lv_obj_set_style_text_font(empty, &lv_font_montserrat_20, 0);
-        lv_obj_align(empty, LV_ALIGN_CENTER, 0, 0);
-        return;
-    }
-
-    for (int i = 0; i < task_count; i++) {
-        lv_obj_t *btn = lv_btn_create(list_container);
-        lv_obj_set_width(btn, lv_pct(100));
-        lv_obj_set_style_bg_color(btn, lv_color_hex(0x2a2a2a), 0);
-        lv_obj_set_style_bg_color(btn, lv_color_hex(0x3a3a3a), LV_STATE_PRESSED);
-        lv_obj_set_style_radius(btn, 8, 0);
-        lv_obj_set_style_pad_ver(btn, 12, 0);
-        lv_obj_set_style_pad_hor(btn, 16, 0);
-
-        lv_obj_t *lbl = lv_label_create(btn);
-        lv_label_set_text_fmt(lbl, LV_SYMBOL_OK "  %s", task_list[i].content);
-        lv_obj_set_style_text_color(lbl, lv_color_white(), 0);
-        lv_obj_set_style_text_font(lbl, &lv_font_montserrat_22, 0);
-        lv_label_set_long_mode(lbl, LV_LABEL_LONG_WRAP);
-        lv_obj_set_width(lbl, lv_pct(100));
-
-        lv_obj_add_event_cb(btn, task_item_click_cb, LV_EVENT_CLICKED, (void *)(intptr_t)i);
-    }
-}
-
-// ---------------------------------------------------------------------
-// Complete task on tap
-// ---------------------------------------------------------------------
-typedef struct {
-    char task_id[64];
-} complete_task_arg_t;
-
-static void complete_task_worker(void *pvParameters)
-{
-    complete_task_arg_t *arg = (complete_task_arg_t *)pvParameters;
-
-    bsp_display_lock(0);
-    set_status("Completing...");
-    bsp_display_unlock();
-
-    bool ok = api_todoist_complete_task(arg->task_id);
-    free(arg);
-
-    // Refresh list
-    free_task_list();
-    task_list = api_todoist_get_tasks_with_ids(&task_count);
-
-    bsp_display_lock(0);
-    if (ok) {
-        set_status("Done!");
-    } else {
-        set_status("Failed to complete");
-    }
-    refresh_list_ui();
-    bsp_display_unlock();
-
-    vTaskDelete(NULL);
-}
-
-static void task_item_click_cb(lv_event_t *e)
-{
-    int idx = (int)(intptr_t)lv_event_get_user_data(e);
-    if (idx < 0 || idx >= task_count) return;
-    if (!wifi_connected) {
-        set_status("No WiFi");
-        return;
-    }
-
-    complete_task_arg_t *arg = malloc(sizeof(complete_task_arg_t));
-    strncpy(arg->task_id, task_list[idx].id, sizeof(arg->task_id) - 1);
-    arg->task_id[sizeof(arg->task_id) - 1] = '\0';
-
-    xTaskCreate(complete_task_worker, "complete_task", 8192, arg, 5, NULL);
+    toast_show_time = esp_timer_get_time() / 1000; // ms
 }
 
 // ---------------------------------------------------------------------
@@ -232,7 +137,7 @@ static void stt_todoist_task(void *pvParameters)
     stt_task_arg_t *arg = (stt_task_arg_t *)pvParameters;
 
     bsp_display_lock(0);
-    set_status("Recognizing speech...");
+    show_toast("Recognizing speech...");
     bsp_display_unlock();
 
     char *transcript = api_google_stt(arg->samples, arg->count);
@@ -241,30 +146,27 @@ static void stt_todoist_task(void *pvParameters)
 
     if (!transcript) {
         bsp_display_lock(0);
-        set_status("Speech not recognized");
+        show_toast("Speech not recognized");
         bsp_display_unlock();
         vTaskDelete(NULL);
         return;
     }
 
+    ESP_LOGI(TAG, "Transcript: '%s'", transcript);
+
     bsp_display_lock(0);
-    lv_label_set_text_fmt(status_label, "Adding: %s", transcript);
+    lv_label_set_text_fmt(toast_label, "Heard: \"%s\"", transcript);
     bsp_display_unlock();
 
     bool added = api_todoist_add_task(transcript);
     free(transcript);
 
-    // Refresh list from server
-    free_task_list();
-    task_list = api_todoist_get_tasks_with_ids(&task_count);
-
     bsp_display_lock(0);
     if (added) {
-        set_status("Item added!");
+        show_toast("Item added to shopping list!");
     } else {
-        set_status("Failed to add item");
+        show_toast("Failed to add item");
     }
-    refresh_list_ui();
     bsp_display_unlock();
 
     vTaskDelete(NULL);
@@ -276,12 +178,12 @@ static void stt_todoist_task(void *pvParameters)
 static void record_btn_pressed_cb(lv_event_t *e)
 {
     if (!wifi_connected) {
-        set_status("No WiFi connection");
+        show_toast("No WiFi connection");
         return;
     }
     rec_sample_count = 0;
     is_recording = true;
-    set_status("Recording...");
+    show_toast("Recording...");
     lv_obj_set_style_bg_color(record_btn, lv_color_hex(0xcc0000), 0);
     lv_label_set_text(record_btn_label, LV_SYMBOL_AUDIO "  RECORDING...");
 }
@@ -298,7 +200,7 @@ static void record_btn_released_cb(lv_event_t *e)
     ESP_LOGI(TAG, "Recorded %d samples (%.1f sec)", samples, (float)samples / SAMPLE_RATE);
 
     if (samples < MIN_REC_SAMPLES) {
-        set_status("Too short, try again");
+        show_toast("Too short, try again");
         return;
     }
 
@@ -306,7 +208,7 @@ static void record_btn_released_cb(lv_event_t *e)
     size_t bytes = samples * sizeof(int16_t);
     int16_t *copy = heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM);
     if (!copy) {
-        set_status("Out of memory");
+        show_toast("Out of memory");
         return;
     }
     memcpy(copy, rec_buffer, bytes);
@@ -315,7 +217,7 @@ static void record_btn_released_cb(lv_event_t *e)
     arg->samples = copy;
     arg->count = samples;
 
-    set_status("Processing...");
+    show_toast("Processing...");
     xTaskCreate(stt_todoist_task, "stt_todoist", 16384, arg, 5, NULL);
 }
 
@@ -331,17 +233,26 @@ static void update_time_cb(lv_timer_t *timer)
     time(&now);
     localtime_r(&now, &timeinfo);
 
-    if (time_label) {
+    if (clock_label) {
         if (timeinfo.tm_year > 100) {
-            lv_label_set_text_fmt(time_label, "%02d:%02d", timeinfo.tm_hour, timeinfo.tm_min);
+            lv_label_set_text_fmt(clock_label, "%02d:%02d", timeinfo.tm_hour, timeinfo.tm_min);
         } else {
-            lv_label_set_text(time_label, "--:--");
+            lv_label_set_text(clock_label, "--:--");
         }
     }
 
     if (wifi_indicator) {
         lv_obj_set_style_bg_color(wifi_indicator,
             wifi_connected ? lv_color_hex(0x4caf50) : lv_color_hex(0xf44336), 0);
+    }
+
+    // Auto-hide toast after TOAST_DURATION_MS
+    if (toast_bar && toast_show_time > 0) {
+        int64_t now_ms = esp_timer_get_time() / 1000;
+        if (now_ms - toast_show_time > TOAST_DURATION_MS) {
+            lv_obj_add_flag(toast_bar, LV_OBJ_FLAG_HIDDEN);
+            toast_show_time = 0;
+        }
     }
 
     // Night mode: dim backlight between 21:00 and 07:00
@@ -355,61 +266,6 @@ static void update_time_cb(lv_timer_t *timer)
 }
 
 // ---------------------------------------------------------------------
-// Initial Task List Fetch (runs once at startup)
-// ---------------------------------------------------------------------
-static void fetch_tasks_worker(void *pvParameters)
-{
-    ESP_LOGI(TAG, "fetch_tasks_worker: started, wifi_connected=%d", wifi_connected);
-
-    // Wait for WiFi if not yet connected
-    for (int i = 0; i < 100 && !wifi_connected; i++) {
-        if (i % 10 == 0) ESP_LOGI(TAG, "Waiting for WiFi... (%d/100)", i);
-        vTaskDelay(pdMS_TO_TICKS(200));
-    }
-
-    if (!wifi_connected) {
-        ESP_LOGW(TAG, "fetch_tasks_worker: WiFi not connected after waiting");
-        bsp_display_lock(0);
-        set_status("WiFi not connected");
-        bsp_display_unlock();
-        vTaskDelete(NULL);
-        return;
-    }
-
-    ESP_LOGI(TAG, "fetch_tasks_worker: WiFi connected, fetching tasks...");
-    bsp_display_lock(0);
-    set_status("Loading list...");
-    bsp_display_unlock();
-
-    free_task_list();
-    task_list = api_todoist_get_tasks_with_ids(&task_count);
-
-    ESP_LOGI(TAG, "fetch_tasks_worker: got %d tasks (task_list=%p)", task_count, (void *)task_list);
-
-    bsp_display_lock(0);
-    if (task_list) {
-        lv_label_set_text_fmt(status_label, "Ready (%d items)", task_count);
-    } else {
-        set_status("Failed to load list");
-    }
-    refresh_list_ui();
-    bsp_display_unlock();
-
-    vTaskDelete(NULL);
-}
-
-static void refresh_btn_click_cb(lv_event_t *e)
-{
-    ESP_LOGI(TAG, "Refresh button clicked, wifi=%d", wifi_connected);
-    if (!wifi_connected) {
-        set_status("No WiFi");
-        return;
-    }
-    set_status("Refreshing...");
-    xTaskCreate(fetch_tasks_worker, "refresh", 8192, NULL, 4, NULL);
-}
-
-// ---------------------------------------------------------------------
 // Build UI
 // ---------------------------------------------------------------------
 static void create_ui(void)
@@ -418,76 +274,40 @@ static void create_ui(void)
     lv_obj_set_style_bg_color(scr, lv_color_hex(0x1a1a1a), 0);
     lv_obj_remove_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
 
-    // ---- Header (60px) ----
-    lv_obj_t *header = lv_obj_create(scr);
-    lv_obj_set_size(header, LCD_H_RES, 60);
-    lv_obj_align(header, LV_ALIGN_TOP_MID, 0, 0);
-    lv_obj_set_style_bg_color(header, lv_color_hex(0x0d0d0d), 0);
-    lv_obj_set_style_border_width(header, 0, 0);
-    lv_obj_set_style_radius(header, 0, 0);
-    lv_obj_remove_flag(header, LV_OBJ_FLAG_SCROLLABLE);
-
-    // WiFi indicator (small circle)
-    wifi_indicator = lv_obj_create(header);
+    // ---- WiFi indicator (top-left corner) ----
+    wifi_indicator = lv_obj_create(scr);
     lv_obj_set_size(wifi_indicator, 16, 16);
-    lv_obj_align(wifi_indicator, LV_ALIGN_LEFT_MID, 10, 0);
+    lv_obj_align(wifi_indicator, LV_ALIGN_TOP_LEFT, 16, 16);
     lv_obj_set_style_radius(wifi_indicator, LV_RADIUS_CIRCLE, 0);
     lv_obj_set_style_bg_color(wifi_indicator, lv_color_hex(0xf44336), 0);
     lv_obj_set_style_border_width(wifi_indicator, 0, 0);
 
-    // Title
-    lv_obj_t *title = lv_label_create(header);
-    lv_label_set_text(title, "Shopping List");
-    lv_obj_set_style_text_color(title, lv_color_white(), 0);
-    lv_obj_set_style_text_font(title, &lv_font_montserrat_24, 0);
-    lv_obj_align(title, LV_ALIGN_LEFT_MID, 40, 0);
+    // ---- Large Clock (center of screen) ----
+    clock_label = lv_label_create(scr);
+    lv_label_set_text(clock_label, "--:--");
+    lv_obj_set_style_text_color(clock_label, lv_color_white(), 0);
+    lv_obj_set_style_text_font(clock_label, &lv_font_montserrat_48, 0);
+    lv_obj_align(clock_label, LV_ALIGN_CENTER, 0, -80);
 
-    // Refresh button
-    lv_obj_t *refresh_btn = lv_btn_create(header);
-    lv_obj_set_size(refresh_btn, 50, 40);
-    lv_obj_align(refresh_btn, LV_ALIGN_RIGHT_MID, -80, 0);
-    lv_obj_set_style_bg_color(refresh_btn, lv_color_hex(0x333333), 0);
-    lv_obj_set_style_bg_color(refresh_btn, lv_color_hex(0x555555), LV_STATE_PRESSED);
-    lv_obj_set_style_radius(refresh_btn, 6, 0);
-    lv_obj_t *refresh_lbl = lv_label_create(refresh_btn);
-    lv_label_set_text(refresh_lbl, LV_SYMBOL_REFRESH);
-    lv_obj_set_style_text_color(refresh_lbl, lv_color_white(), 0);
-    lv_obj_center(refresh_lbl);
-    lv_obj_add_event_cb(refresh_btn, refresh_btn_click_cb, LV_EVENT_CLICKED, NULL);
+    // ---- Toast Bar (below clock, hidden by default) ----
+    toast_bar = lv_obj_create(scr);
+    lv_obj_set_size(toast_bar, LCD_H_RES - 40, 80);
+    lv_obj_align(toast_bar, LV_ALIGN_CENTER, 0, 40);
+    lv_obj_set_style_bg_color(toast_bar, lv_color_hex(0x333333), 0);
+    lv_obj_set_style_border_width(toast_bar, 0, 0);
+    lv_obj_set_style_radius(toast_bar, 12, 0);
+    lv_obj_remove_flag(toast_bar, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(toast_bar, LV_OBJ_FLAG_HIDDEN);
 
-    // Time
-    time_label = lv_label_create(header);
-    lv_label_set_text(time_label, "--:--");
-    lv_obj_set_style_text_color(time_label, lv_color_white(), 0);
-    lv_obj_set_style_text_font(time_label, &lv_font_montserrat_24, 0);
-    lv_obj_align(time_label, LV_ALIGN_RIGHT_MID, -16, 0);
+    toast_label = lv_label_create(toast_bar);
+    lv_label_set_text(toast_label, "");
+    lv_obj_set_style_text_color(toast_label, lv_color_white(), 0);
+    lv_obj_set_style_text_font(toast_label, &lv_font_montserrat_24, 0);
+    lv_label_set_long_mode(toast_label, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(toast_label, LCD_H_RES - 80);
+    lv_obj_center(toast_label);
 
-    // ---- Scrollable List Area (~560px) ----
-    list_container = lv_obj_create(scr);
-    lv_obj_set_size(list_container, LCD_H_RES - 20, 560);
-    lv_obj_align(list_container, LV_ALIGN_TOP_MID, 0, 60);
-    lv_obj_set_style_bg_color(list_container, lv_color_hex(0x1a1a1a), 0);
-    lv_obj_set_style_border_width(list_container, 0, 0);
-    lv_obj_set_style_pad_all(list_container, 8, 0);
-    lv_obj_set_style_pad_row(list_container, 8, 0);
-    lv_obj_set_flex_flow(list_container, LV_FLEX_FLOW_COLUMN);
-
-    // ---- Status Bar (40px) ----
-    lv_obj_t *status_bar = lv_obj_create(scr);
-    lv_obj_set_size(status_bar, LCD_H_RES, 40);
-    lv_obj_align(status_bar, LV_ALIGN_BOTTOM_MID, 0, -140);
-    lv_obj_set_style_bg_color(status_bar, lv_color_hex(0x0d0d0d), 0);
-    lv_obj_set_style_border_width(status_bar, 0, 0);
-    lv_obj_set_style_radius(status_bar, 0, 0);
-    lv_obj_remove_flag(status_bar, LV_OBJ_FLAG_SCROLLABLE);
-
-    status_label = lv_label_create(status_bar);
-    lv_label_set_text(status_label, "Starting...");
-    lv_obj_set_style_text_color(status_label, lv_color_hex(0xaaaaaa), 0);
-    lv_obj_set_style_text_font(status_label, &lv_font_montserrat_18, 0);
-    lv_obj_center(status_label);
-
-    // ---- Record Button (140px) ----
+    // ---- Record Button (bottom) ----
     record_btn = lv_btn_create(scr);
     lv_obj_set_size(record_btn, LCD_H_RES - 40, 120);
     lv_obj_align(record_btn, LV_ALIGN_BOTTOM_MID, 0, -10);
@@ -595,8 +415,4 @@ void app_main(void)
     bsp_display_lock(0);
     create_ui();
     bsp_display_unlock();
-
-    // 9. Fetch initial task list
-    ESP_LOGI(TAG, "Starting initial task fetch...");
-    xTaskCreate(fetch_tasks_worker, "init_fetch", 8192, NULL, 4, NULL);
 }
