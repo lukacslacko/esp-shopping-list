@@ -494,69 +494,91 @@ mc_server_status_t api_mc_server_status(const char *host, uint16_t port)
         return status;
     }
 
-    // Read response
-    uint8_t resp[4096];
-    int total = 0;
-    while (total < (int)sizeof(resp) - 1) {
-        int n = recv(sock, resp + total, sizeof(resp) - 1 - total, 0);
+    // Read response header (varints: packet_length, packet_id, string_length)
+    // then read enough of the JSON to get players info (no need for full favicon)
+    uint8_t hdr[16];
+    int hdr_len = 0;
+    while (hdr_len < (int)sizeof(hdr)) {
+        int n = recv(sock, hdr + hdr_len, 1, 0);
         if (n <= 0) break;
-        total += n;
-        // Try to parse to see if we have a complete packet
-        if (total > 5) break; // We'll get more below if needed
+        hdr_len++;
+        // Try parsing varints to see if we have enough header bytes
+        int off = 0;
+        int32_t v;
+        int r = mc_read_varint(hdr, hdr_len, &v); // packet_length
+        if (r < 0) continue;
+        off += r;
+        r = mc_read_varint(hdr + off, hdr_len - off, &v); // packet_id
+        if (r < 0) continue;
+        off += r;
+        r = mc_read_varint(hdr + off, hdr_len - off, &v); // string_length
+        if (r >= 0) break; // got all three varints
     }
 
-    close(sock);
-
-    if (total < 5) {
-        ESP_LOGW(TAG, "MC: short response (%d bytes)", total);
-        return status;
-    }
-
-    // Parse: varint packet_length, varint packet_id, varint string_length, json string
+    // Parse the three varints from header
     int off = 0;
-    int32_t pkt_len;
-    int r = mc_read_varint(resp, total, &pkt_len);
-    if (r < 0) return status;
+    int32_t pkt_len, pkt_id, str_len;
+    int r = mc_read_varint(hdr, hdr_len, &pkt_len);
+    if (r < 0) { close(sock); return status; }
+    off += r;
+    r = mc_read_varint(hdr + off, hdr_len - off, &pkt_id);
+    if (r < 0) { close(sock); return status; }
+    off += r;
+    r = mc_read_varint(hdr + off, hdr_len - off, &str_len);
+    if (r < 0) { close(sock); return status; }
     off += r;
 
-    int32_t pkt_id;
-    r = mc_read_varint(resp + off, total - off, &pkt_id);
-    if (r < 0) return status;
-    off += r;
+    ESP_LOGI(TAG, "MC: pkt_len=%ld str_len=%ld", pkt_len, str_len);
 
-    int32_t str_len;
-    r = mc_read_varint(resp + off, total - off, &str_len);
-    if (r < 0) return status;
-    off += r;
+    // Read enough JSON to parse players (first 512 bytes is plenty, skip favicon)
+    int to_read = str_len < 512 ? str_len : 512;
+    // Include any leftover bytes from header buffer
+    int leftover = hdr_len - off;
+    char *json_str = malloc(to_read + 1);
+    if (!json_str) { close(sock); return status; }
 
-    // We may need to read more data for the full JSON string
-    int needed = off + str_len;
-    if (needed > (int)sizeof(resp) - 1) needed = sizeof(resp) - 1;
-
-    // Re-open isn't needed; we may already have enough, but let's check
-    // Actually the socket is closed. If we don't have enough data, truncate.
-    if (total < needed) {
-        ESP_LOGW(TAG, "MC: truncated response (have %d, need %d)", total, needed);
-        str_len = total - off;
+    int json_got = 0;
+    if (leftover > 0) {
+        int copy = leftover < to_read ? leftover : to_read;
+        memcpy(json_str, hdr + off, copy);
+        json_got = copy;
     }
-
-    if (str_len <= 0) return status;
-
-    // Null-terminate the JSON
-    char *json_str = malloc(str_len + 1);
-    if (!json_str) return status;
-    memcpy(json_str, resp + off, str_len);
-    json_str[str_len] = '\0';
+    while (json_got < to_read) {
+        int n = recv(sock, json_str + json_got, to_read - json_got, 0);
+        if (n <= 0) break;
+        json_got += n;
+    }
+    close(sock);
+    json_str[json_got] = '\0';
 
     ESP_LOGI(TAG, "MC status JSON (first 300): %.300s", json_str);
 
+    // The JSON may be truncated (we skipped favicon), so we can't use cJSON_Parse directly.
+    // Instead, extract fields manually from the partial JSON.
+    // Look for "players":{"max":N,"online":N} or "online":N,"max":N
     cJSON *json = cJSON_Parse(json_str);
-    free(json_str);
     if (!json) {
-        ESP_LOGE(TAG, "MC: JSON parse failed");
+        // Try to extract players from partial JSON using string search
+        ESP_LOGI(TAG, "MC: full parse failed, trying partial extraction");
+        const char *p;
+        int online = -1, max = -1;
+        p = strstr(json_str, "\"online\":");
+        if (p) online = atoi(p + 9);
+        p = strstr(json_str, "\"max\":");
+        if (p) max = atoi(p + 6);
+        if (online >= 0 && max >= 0) {
+            status.online = true;
+            status.players_online = online;
+            status.players_max = max;
+            ESP_LOGI(TAG, "MC: (partial) players=%d/%d", online, max);
+        } else {
+            ESP_LOGE(TAG, "MC: could not extract player info");
+        }
+        free(json_str);
         return status;
     }
 
+    free(json_str);
     status.online = true;
 
     cJSON *players = cJSON_GetObjectItem(json, "players");
