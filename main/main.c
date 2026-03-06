@@ -58,9 +58,14 @@ static lv_obj_t *toast_label = NULL;
 static lv_obj_t *toast_bar = NULL;
 static lv_obj_t *record_btn = NULL;
 static lv_obj_t *record_btn_label = NULL;
+static lv_obj_t *mc_status_label = NULL;
 
 // Toast auto-clear
 static int64_t toast_show_time = 0;
+
+// Minecraft server check
+#define MC_CHECK_INTERVAL_MS (15 * 60 * 1000)
+static int64_t mc_last_check = 0;
 
 // ---------------------------------------------------------------------
 // WiFi Event Handler
@@ -222,6 +227,28 @@ static void record_btn_released_cb(lv_event_t *e)
 }
 
 // ---------------------------------------------------------------------
+// Minecraft Server Status Check
+// ---------------------------------------------------------------------
+static void mc_check_worker(void *pvParameters)
+{
+    mc_server_status_t st = api_mc_server_status("192.168.1.38", 25555);
+
+    bsp_display_lock(0);
+    if (mc_status_label) {
+        if (st.online) {
+            lv_label_set_text_fmt(mc_status_label, "MC: %d/%d", st.players_online, st.players_max);
+            lv_obj_set_style_text_color(mc_status_label, lv_color_hex(0x4caf50), 0);
+        } else {
+            lv_label_set_text(mc_status_label, "MC: off");
+            lv_obj_set_style_text_color(mc_status_label, lv_color_hex(0x888888), 0);
+        }
+    }
+    bsp_display_unlock();
+
+    vTaskDelete(NULL);
+}
+
+// ---------------------------------------------------------------------
 // Time Update Timer
 // ---------------------------------------------------------------------
 static bool night_mode_active = false;
@@ -263,6 +290,15 @@ static void update_time_cb(lv_timer_t *timer)
             bsp_display_brightness_set(should_dim ? 10 : 100);
         }
     }
+
+    // Periodic Minecraft server check
+    if (wifi_connected) {
+        int64_t now_ms = esp_timer_get_time() / 1000;
+        if (mc_last_check == 0 || (now_ms - mc_last_check > MC_CHECK_INTERVAL_MS)) {
+            mc_last_check = now_ms;
+            xTaskCreate(mc_check_worker, "mc_check", 8192, NULL, 3, NULL);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -281,6 +317,13 @@ static void create_ui(void)
     lv_obj_set_style_radius(wifi_indicator, LV_RADIUS_CIRCLE, 0);
     lv_obj_set_style_bg_color(wifi_indicator, lv_color_hex(0xf44336), 0);
     lv_obj_set_style_border_width(wifi_indicator, 0, 0);
+
+    // ---- Minecraft server status (top-right) ----
+    mc_status_label = lv_label_create(scr);
+    lv_label_set_text(mc_status_label, "MC: ...");
+    lv_obj_set_style_text_color(mc_status_label, lv_color_hex(0x888888), 0);
+    lv_obj_set_style_text_font(mc_status_label, &lv_font_montserrat_18, 0);
+    lv_obj_align(mc_status_label, LV_ALIGN_TOP_RIGHT, -16, 12);
 
     // ---- Large Clock (center of screen) ----
     clock_label = lv_label_create(scr);

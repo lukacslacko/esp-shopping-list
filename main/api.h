@@ -27,4 +27,15 @@ typedef struct {
 // Fetch tasks with IDs. Returns malloc'd array (caller must free each id/content + the array).
 todoist_task_t *api_todoist_get_tasks_with_ids(int *out_count);
 
+// Minecraft server status
+typedef struct {
+    bool online;
+    int players_online;
+    int players_max;
+    char motd[128];
+} mc_server_status_t;
+
+// Query Minecraft server status via Server List Ping protocol.
+mc_server_status_t api_mc_server_status(const char *host, uint16_t port);
+
 #endif // API_H
