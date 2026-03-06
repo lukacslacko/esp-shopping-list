@@ -68,15 +68,21 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
                                int32_t event_id, void *event_data)
 {
     if (event_base == WIFI_EVENT) {
-        if (event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        ESP_LOGI(TAG, "WiFi event: %ld", event_id);
+        if (event_id == WIFI_EVENT_STA_START) {
+            ESP_LOGI(TAG, "WiFi STA started");
+        } else if (event_id == WIFI_EVENT_STA_CONNECTED) {
+            ESP_LOGI(TAG, "WiFi STA connected to AP");
+        } else if (event_id == WIFI_EVENT_STA_DISCONNECTED) {
             wifi_connected = false;
             ESP_LOGW(TAG, "WiFi disconnected, reconnecting...");
             esp_wifi_connect();
         }
     } else if (event_base == IP_EVENT) {
         if (event_id == IP_EVENT_STA_GOT_IP) {
+            ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
             wifi_connected = true;
-            ESP_LOGI(TAG, "WiFi connected, got IP");
+            ESP_LOGI(TAG, "WiFi connected, got IP: " IPSTR, IP2STR(&event->ip_info.ip));
         }
     }
 }
@@ -351,14 +357,18 @@ static void update_time_cb(lv_timer_t *timer)
 // ---------------------------------------------------------------------
 // Initial Task List Fetch (runs once at startup)
 // ---------------------------------------------------------------------
-static void initial_fetch_task(void *pvParameters)
+static void fetch_tasks_worker(void *pvParameters)
 {
-    // Wait for WiFi
+    ESP_LOGI(TAG, "fetch_tasks_worker: started, wifi_connected=%d", wifi_connected);
+
+    // Wait for WiFi if not yet connected
     for (int i = 0; i < 100 && !wifi_connected; i++) {
+        if (i % 10 == 0) ESP_LOGI(TAG, "Waiting for WiFi... (%d/100)", i);
         vTaskDelay(pdMS_TO_TICKS(200));
     }
 
     if (!wifi_connected) {
+        ESP_LOGW(TAG, "fetch_tasks_worker: WiFi not connected after waiting");
         bsp_display_lock(0);
         set_status("WiFi not connected");
         bsp_display_unlock();
@@ -366,15 +376,19 @@ static void initial_fetch_task(void *pvParameters)
         return;
     }
 
+    ESP_LOGI(TAG, "fetch_tasks_worker: WiFi connected, fetching tasks...");
     bsp_display_lock(0);
     set_status("Loading list...");
     bsp_display_unlock();
 
+    free_task_list();
     task_list = api_todoist_get_tasks_with_ids(&task_count);
 
+    ESP_LOGI(TAG, "fetch_tasks_worker: got %d tasks (task_list=%p)", task_count, (void *)task_list);
+
     bsp_display_lock(0);
-    if (task_count >= 0) {
-        set_status("Ready");
+    if (task_list) {
+        lv_label_set_text_fmt(status_label, "Ready (%d items)", task_count);
     } else {
         set_status("Failed to load list");
     }
@@ -382,6 +396,17 @@ static void initial_fetch_task(void *pvParameters)
     bsp_display_unlock();
 
     vTaskDelete(NULL);
+}
+
+static void refresh_btn_click_cb(lv_event_t *e)
+{
+    ESP_LOGI(TAG, "Refresh button clicked, wifi=%d", wifi_connected);
+    if (!wifi_connected) {
+        set_status("No WiFi");
+        return;
+    }
+    set_status("Refreshing...");
+    xTaskCreate(fetch_tasks_worker, "refresh", 8192, NULL, 4, NULL);
 }
 
 // ---------------------------------------------------------------------
@@ -416,6 +441,19 @@ static void create_ui(void)
     lv_obj_set_style_text_color(title, lv_color_white(), 0);
     lv_obj_set_style_text_font(title, &lv_font_montserrat_24, 0);
     lv_obj_align(title, LV_ALIGN_LEFT_MID, 40, 0);
+
+    // Refresh button
+    lv_obj_t *refresh_btn = lv_btn_create(header);
+    lv_obj_set_size(refresh_btn, 50, 40);
+    lv_obj_align(refresh_btn, LV_ALIGN_RIGHT_MID, -80, 0);
+    lv_obj_set_style_bg_color(refresh_btn, lv_color_hex(0x333333), 0);
+    lv_obj_set_style_bg_color(refresh_btn, lv_color_hex(0x555555), LV_STATE_PRESSED);
+    lv_obj_set_style_radius(refresh_btn, 6, 0);
+    lv_obj_t *refresh_lbl = lv_label_create(refresh_btn);
+    lv_label_set_text(refresh_lbl, LV_SYMBOL_REFRESH);
+    lv_obj_set_style_text_color(refresh_lbl, lv_color_white(), 0);
+    lv_obj_center(refresh_lbl);
+    lv_obj_add_event_cb(refresh_btn, refresh_btn_click_cb, LV_EVENT_CLICKED, NULL);
 
     // Time
     time_label = lv_label_create(header);
@@ -487,8 +525,10 @@ void app_main(void)
     ESP_ERROR_CHECK(ret);
 
     // 2. Display
+    ESP_LOGI(TAG, "Initializing display...");
     bsp_display_start();
     bsp_display_backlight_on();
+    ESP_LOGI(TAG, "Display initialized");
 
     // Rotate 90° CW to compensate for physically rotated unit
     lv_display_t *disp = lv_display_get_default();
@@ -497,6 +537,7 @@ void app_main(void)
     }
 
     // 3. Audio (mic only, no speaker needed)
+    ESP_LOGI(TAG, "Initializing audio...");
     if (bsp_audio_init(NULL) == ESP_OK) {
         mic_codec_dev = bsp_audio_codec_microphone_init();
         if (mic_codec_dev) {
@@ -517,6 +558,7 @@ void app_main(void)
     }
 
     // 5. WiFi
+    ESP_LOGI(TAG, "Initializing WiFi (SSID: %s)...", WIFI_SSID);
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
     esp_netif_create_default_wifi_sta();
@@ -537,6 +579,7 @@ void app_main(void)
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
     ESP_ERROR_CHECK(esp_wifi_start());
     ESP_ERROR_CHECK(esp_wifi_connect());
+    ESP_LOGI(TAG, "WiFi init done, connecting...");
 
     // 6. NTP
     esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
@@ -554,5 +597,6 @@ void app_main(void)
     bsp_display_unlock();
 
     // 9. Fetch initial task list
-    xTaskCreate(initial_fetch_task, "init_fetch", 8192, NULL, 4, NULL);
+    ESP_LOGI(TAG, "Starting initial task fetch...");
+    xTaskCreate(fetch_tasks_worker, "init_fetch", 8192, NULL, 4, NULL);
 }

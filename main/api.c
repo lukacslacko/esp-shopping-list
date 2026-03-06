@@ -161,12 +161,16 @@ char *api_google_stt(const int16_t *audio_samples, size_t sample_count)
 
 bool api_todoist_add_task(const char *content)
 {
+    ESP_LOGI(TAG, "Adding task: '%s' to project '%s'", content, TODOIST_PROJECT_ID);
+
     cJSON *root = cJSON_CreateObject();
     cJSON_AddStringToObject(root, "content", content);
     cJSON_AddStringToObject(root, "project_id", TODOIST_PROJECT_ID);
     char *post_data = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);
     if (!post_data) return false;
+
+    ESP_LOGI(TAG, "Add task POST body: %s", post_data);
 
     http_buf_t resp;
     http_buf_init(&resp);
@@ -175,7 +179,7 @@ bool api_todoist_add_task(const char *content)
     snprintf(auth_header, sizeof(auth_header), "Bearer %s", TODOIST_API_TOKEN);
 
     esp_http_client_config_t cfg = {
-        .url = "https://api.todoist.com/rest/v2/tasks",
+        .url = "https://api.todoist.com/api/v1/tasks",
         .method = HTTP_METHOD_POST,
         .event_handler = http_event_handler,
         .user_data = &resp,
@@ -191,13 +195,16 @@ bool api_todoist_add_task(const char *content)
     int status = esp_http_client_get_status_code(client);
     esp_http_client_cleanup(client);
     free(post_data);
-    http_buf_free(&resp);
 
-    if (err == ESP_OK && (status == 200 || status == 204)) {
-        ESP_LOGI(TAG, "Task added successfully");
+    if (err == ESP_OK && (status >= 200 && status < 300)) {
+        ESP_LOGI(TAG, "Task added successfully (status=%d)", status);
+        if (resp.data) ESP_LOGI(TAG, "Add task response: %s", resp.data);
+        http_buf_free(&resp);
         return true;
     }
     ESP_LOGE(TAG, "Add task failed: err=%d status=%d", err, status);
+    if (resp.data) ESP_LOGE(TAG, "Add task response: %s", resp.data);
+    http_buf_free(&resp);
     return false;
 }
 
@@ -207,7 +214,7 @@ char **api_todoist_get_tasks(int *out_count)
 
     char url[256];
     snprintf(url, sizeof(url),
-             "https://api.todoist.com/rest/v2/tasks?project_id=%s", TODOIST_PROJECT_ID);
+             "https://api.todoist.com/api/v1/tasks?project_id=%s", TODOIST_PROJECT_ID);
 
     char auth_header[128];
     snprintf(auth_header, sizeof(auth_header), "Bearer %s", TODOIST_API_TOKEN);
@@ -265,14 +272,19 @@ todoist_task_t *api_todoist_get_tasks_with_ids(int *out_count)
 
     char url[256];
     snprintf(url, sizeof(url),
-             "https://api.todoist.com/rest/v2/tasks?project_id=%s", TODOIST_PROJECT_ID);
+             "https://api.todoist.com/api/v1/tasks?project_id=%s", TODOIST_PROJECT_ID);
+
+    ESP_LOGI(TAG, "Fetching tasks from: %s", url);
 
     char auth_header[128];
     snprintf(auth_header, sizeof(auth_header), "Bearer %s", TODOIST_API_TOKEN);
 
     http_buf_t resp;
     http_buf_init(&resp);
-    if (!resp.data) return NULL;
+    if (!resp.data) {
+        ESP_LOGE(TAG, "Failed to allocate HTTP response buffer");
+        return NULL;
+    }
 
     esp_http_client_config_t cfg = {
         .url = url,
@@ -285,24 +297,40 @@ todoist_task_t *api_todoist_get_tasks_with_ids(int *out_count)
     esp_http_client_handle_t client = esp_http_client_init(&cfg);
     esp_http_client_set_header(client, "Authorization", auth_header);
 
+    ESP_LOGI(TAG, "Performing GET request...");
     esp_err_t err = esp_http_client_perform(client);
     int status = esp_http_client_get_status_code(client);
     esp_http_client_cleanup(client);
 
+    ESP_LOGI(TAG, "GET tasks result: err=%d status=%d resp_len=%d", err, status, (int)resp.len);
+
     if (err != ESP_OK || status != 200 || !resp.data) {
         ESP_LOGE(TAG, "Get tasks failed: err=%d status=%d", err, status);
+        if (resp.data && resp.len > 0) ESP_LOGE(TAG, "Response body: %s", resp.data);
         http_buf_free(&resp);
         return NULL;
     }
 
-    cJSON *arr = cJSON_Parse(resp.data);
+    ESP_LOGI(TAG, "Tasks response (first 500 chars): %.500s", resp.data);
+
+    cJSON *root = cJSON_Parse(resp.data);
     http_buf_free(&resp);
+    if (!root) {
+        ESP_LOGE(TAG, "Failed to parse tasks JSON");
+        return NULL;
+    }
+
+    // v1 API wraps tasks in {"results": [...]}
+    cJSON *arr = cJSON_GetObjectItem(root, "results");
+    if (!arr) arr = root; // fallback if top-level is array
     if (!cJSON_IsArray(arr)) {
-        cJSON_Delete(arr);
+        ESP_LOGE(TAG, "Response has no 'results' array (type=%d)", arr ? arr->type : -1);
+        cJSON_Delete(root);
         return NULL;
     }
 
     int count = cJSON_GetArraySize(arr);
+    ESP_LOGI(TAG, "Parsed %d tasks from JSON", count);
     todoist_task_t *tasks = calloc(count, sizeof(todoist_task_t));
     int valid = 0;
     for (int i = 0; i < count; i++) {
@@ -312,11 +340,16 @@ todoist_task_t *api_todoist_get_tasks_with_ids(int *out_count)
         if (cJSON_IsString(content) && cJSON_IsString(id)) {
             tasks[valid].content = strdup(content->valuestring);
             tasks[valid].id = strdup(id->valuestring);
+            ESP_LOGI(TAG, "  Task[%d]: id=%s content='%s'", valid, tasks[valid].id, tasks[valid].content);
             valid++;
+        } else {
+            ESP_LOGW(TAG, "  Task[%d]: skipped (content=%d id=%d)", i,
+                     cJSON_IsString(content), cJSON_IsString(id));
         }
     }
-    cJSON_Delete(arr);
+    cJSON_Delete(root);
     *out_count = valid;
+    ESP_LOGI(TAG, "Returning %d valid tasks", valid);
     return tasks;
 }
 
@@ -324,7 +357,9 @@ bool api_todoist_complete_task(const char *task_id)
 {
     char url[256];
     snprintf(url, sizeof(url),
-             "https://api.todoist.com/rest/v2/tasks/%s/close", task_id);
+             "https://api.todoist.com/api/v1/tasks/%s/close", task_id);
+
+    ESP_LOGI(TAG, "Closing task: %s url: %s", task_id, url);
 
     char auth_header[128];
     snprintf(auth_header, sizeof(auth_header), "Bearer %s", TODOIST_API_TOKEN);
@@ -346,12 +381,14 @@ bool api_todoist_complete_task(const char *task_id)
     esp_err_t err = esp_http_client_perform(client);
     int status = esp_http_client_get_status_code(client);
     esp_http_client_cleanup(client);
-    http_buf_free(&resp);
 
-    if (err == ESP_OK && (status == 200 || status == 204)) {
-        ESP_LOGI(TAG, "Task %s completed", task_id);
+    if (err == ESP_OK && (status >= 200 && status < 300)) {
+        ESP_LOGI(TAG, "Task %s completed (status=%d)", task_id, status);
+        http_buf_free(&resp);
         return true;
     }
     ESP_LOGE(TAG, "Complete task failed: err=%d status=%d", err, status);
+    if (resp.data) ESP_LOGE(TAG, "Response: %s", resp.data);
+    http_buf_free(&resp);
     return false;
 }
