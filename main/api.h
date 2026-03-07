@@ -27,6 +27,16 @@ typedef struct {
 // Fetch tasks with IDs. Returns malloc'd array (caller must free each id/content + the array).
 todoist_task_t *api_todoist_get_tasks_with_ids(int *out_count);
 
+// Home Assistant sensor reading
+typedef struct {
+    bool ok;
+    float value;
+    char unit[16];
+} ha_sensor_reading_t;
+
+// Query a Home Assistant sensor entity state. Returns reading with ok=true on success.
+ha_sensor_reading_t api_ha_get_sensor(const char *entity_id);
+
 // Minecraft server status
 typedef struct {
     bool online;

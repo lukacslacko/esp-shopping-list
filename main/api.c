@@ -395,6 +395,77 @@ bool api_todoist_complete_task(const char *task_id)
     return false;
 }
 
+// ---- Home Assistant ----
+
+ha_sensor_reading_t api_ha_get_sensor(const char *entity_id)
+{
+    ha_sensor_reading_t reading = {0};
+
+    char url[256];
+    snprintf(url, sizeof(url), "http://192.168.1.223:8123/api/states/%s", entity_id);
+
+    ESP_LOGI(TAG, "HA: querying %s", url);
+
+    char auth_header[256];
+    snprintf(auth_header, sizeof(auth_header), "Bearer %s", HA_API_TOKEN);
+
+    http_buf_t resp;
+    http_buf_init(&resp);
+    if (!resp.data) return reading;
+
+    esp_http_client_config_t cfg = {
+        .url = url,
+        .method = HTTP_METHOD_GET,
+        .event_handler = http_event_handler,
+        .user_data = &resp,
+        .timeout_ms = 10000,
+    };
+    esp_http_client_handle_t client = esp_http_client_init(&cfg);
+    esp_http_client_set_header(client, "Authorization", auth_header);
+    esp_http_client_set_header(client, "Content-Type", "application/json");
+
+    esp_err_t err = esp_http_client_perform(client);
+    int status = esp_http_client_get_status_code(client);
+    esp_http_client_cleanup(client);
+
+    if (err != ESP_OK || status != 200 || !resp.data) {
+        ESP_LOGE(TAG, "HA: request failed err=%d status=%d", err, status);
+        if (resp.data) ESP_LOGE(TAG, "HA response: %s", resp.data);
+        http_buf_free(&resp);
+        return reading;
+    }
+
+    ESP_LOGI(TAG, "HA response: %.300s", resp.data);
+
+    cJSON *json = cJSON_Parse(resp.data);
+    http_buf_free(&resp);
+    if (!json) {
+        ESP_LOGE(TAG, "HA: JSON parse failed");
+        return reading;
+    }
+
+    cJSON *state = cJSON_GetObjectItem(json, "state");
+    if (cJSON_IsString(state) && strcmp(state->valuestring, "unavailable") != 0
+                               && strcmp(state->valuestring, "unknown") != 0) {
+        reading.ok = true;
+        reading.value = atof(state->valuestring);
+        // Try to get unit from attributes
+        cJSON *attrs = cJSON_GetObjectItem(json, "attributes");
+        if (attrs) {
+            cJSON *unit = cJSON_GetObjectItem(attrs, "unit_of_measurement");
+            if (cJSON_IsString(unit)) {
+                strncpy(reading.unit, unit->valuestring, sizeof(reading.unit) - 1);
+            }
+        }
+        ESP_LOGI(TAG, "HA: %s = %.1f %s", entity_id, reading.value, reading.unit);
+    } else {
+        ESP_LOGW(TAG, "HA: sensor state unavailable for %s", entity_id);
+    }
+
+    cJSON_Delete(json);
+    return reading;
+}
+
 // ---- Minecraft Server List Ping ----
 
 static int mc_write_varint(uint8_t *buf, int32_t value)

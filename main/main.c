@@ -38,6 +38,11 @@ static const char *TAG = "main";
 #define MIN_REC_SAMPLES (SAMPLE_RATE / 2)  // 0.5 seconds minimum
 #define TOAST_DURATION_MS 8000
 
+// Home Assistant BMP280 sensor entity IDs (fill these in when sensor is set up)
+#define HA_ENTITY_TEMPERATURE  "sensor.pico_balcony_temperature"
+#define HA_ENTITY_PRESSURE     "sensor.pico_balcony_pressure"
+#define HA_CHECK_INTERVAL_MS   (5 * 60 * 1000)  // 5 minutes
+
 // ---------------------------------------------------------------------
 // Globals
 // ---------------------------------------------------------------------
@@ -59,6 +64,7 @@ static lv_obj_t *toast_bar = NULL;
 static lv_obj_t *record_btn = NULL;
 static lv_obj_t *record_btn_label = NULL;
 static lv_obj_t *mc_status_label = NULL;
+static lv_obj_t *ha_sensor_label = NULL;
 
 // Toast auto-clear
 static int64_t toast_show_time = 0;
@@ -66,6 +72,9 @@ static int64_t toast_show_time = 0;
 // Minecraft server check
 #define MC_CHECK_INTERVAL_MS (15 * 60 * 1000)
 static int64_t mc_last_check = 0;
+
+// Home Assistant sensor check
+static int64_t ha_last_check = 0;
 
 // ---------------------------------------------------------------------
 // WiFi Event Handler
@@ -249,6 +258,42 @@ static void mc_check_worker(void *pvParameters)
 }
 
 // ---------------------------------------------------------------------
+// Home Assistant Sensor Check
+// ---------------------------------------------------------------------
+static void ha_check_worker(void *pvParameters)
+{
+    ha_sensor_reading_t temp = api_ha_get_sensor(HA_ENTITY_TEMPERATURE);
+    ha_sensor_reading_t pres = api_ha_get_sensor(HA_ENTITY_PRESSURE);
+
+    bsp_display_lock(0);
+    if (ha_sensor_label) {
+        if (temp.ok && pres.ok) {
+            int t_int = (int)temp.value;
+            int t_dec = ((int)(temp.value * 10)) % 10;
+            if (t_dec < 0) t_dec = -t_dec;
+            lv_label_set_text_fmt(ha_sensor_label, "%d.%dC  %d hPa",
+                                  t_int, t_dec, (int)pres.value);
+            lv_obj_set_style_text_color(ha_sensor_label, lv_color_hex(0x4caf50), 0);
+        } else if (temp.ok) {
+            int t_int = (int)temp.value;
+            int t_dec = ((int)(temp.value * 10)) % 10;
+            if (t_dec < 0) t_dec = -t_dec;
+            lv_label_set_text_fmt(ha_sensor_label, "%d.%dC", t_int, t_dec);
+            lv_obj_set_style_text_color(ha_sensor_label, lv_color_hex(0x4caf50), 0);
+        } else if (pres.ok) {
+            lv_label_set_text_fmt(ha_sensor_label, "%d hPa", (int)pres.value);
+            lv_obj_set_style_text_color(ha_sensor_label, lv_color_hex(0x4caf50), 0);
+        } else {
+            lv_label_set_text(ha_sensor_label, "Sensor: n/a");
+            lv_obj_set_style_text_color(ha_sensor_label, lv_color_hex(0x888888), 0);
+        }
+    }
+    bsp_display_unlock();
+
+    vTaskDelete(NULL);
+}
+
+// ---------------------------------------------------------------------
 // Time Update Timer
 // ---------------------------------------------------------------------
 static bool night_mode_active = false;
@@ -298,6 +343,11 @@ static void update_time_cb(lv_timer_t *timer)
             mc_last_check = now_ms;
             xTaskCreate(mc_check_worker, "mc_check", 8192, NULL, 3, NULL);
         }
+        // Periodic Home Assistant sensor check
+        if (ha_last_check == 0 || (now_ms - ha_last_check > HA_CHECK_INTERVAL_MS)) {
+            ha_last_check = now_ms;
+            xTaskCreate(ha_check_worker, "ha_check", 8192, NULL, 3, NULL);
+        }
     }
 }
 
@@ -324,6 +374,13 @@ static void create_ui(void)
     lv_obj_set_style_text_color(mc_status_label, lv_color_hex(0x888888), 0);
     lv_obj_set_style_text_font(mc_status_label, &lv_font_montserrat_18, 0);
     lv_obj_align(mc_status_label, LV_ALIGN_TOP_RIGHT, -16, 12);
+
+    // ---- Home Assistant sensor (below MC status, top-right) ----
+    ha_sensor_label = lv_label_create(scr);
+    lv_label_set_text(ha_sensor_label, "Sensor: ...");
+    lv_obj_set_style_text_color(ha_sensor_label, lv_color_hex(0x888888), 0);
+    lv_obj_set_style_text_font(ha_sensor_label, &lv_font_montserrat_18, 0);
+    lv_obj_align(ha_sensor_label, LV_ALIGN_TOP_RIGHT, -16, 36);
 
     // ---- Large Clock (center of screen) ----
     clock_label = lv_label_create(scr);
