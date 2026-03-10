@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdint.h>
+#include <inttypes.h>
 #include <time.h>
 #include <sys/time.h>
 #include "freertos/FreeRTOS.h"
@@ -56,6 +57,9 @@ static const char *TAG = "main";
 
 // 48h chart: 576 points at 5-min intervals
 #define HA_CHART_POINTS 576
+#define HA_CHART_ADD_EVERY 20   // add chart point every 20 polls (20*15s = 5min)
+#define MAX_GRID_LABELS 10      // max horizontal grid line labels per chart
+#define CHART_PAD_V 10          // explicit vertical padding inside chart
 
 // ---------------------------------------------------------------------
 // Globals
@@ -94,16 +98,10 @@ static lv_obj_t *temp_chart = NULL;
 static lv_obj_t *pres_chart = NULL;
 static lv_chart_series_t *temp_series = NULL;
 static lv_chart_series_t *pres_series = NULL;
-static lv_obj_t *temp_range_min_label = NULL;
-static lv_obj_t *temp_range_max_label = NULL;
-static lv_obj_t *pres_range_min_label = NULL;
-static lv_obj_t *pres_range_max_label = NULL;
-
-// Observed min/max for auto-ranging (temp stored as value*10)
-static int32_t temp_observed_min = INT32_MAX;
-static int32_t temp_observed_max = INT32_MIN;
-static int32_t pres_observed_min = INT32_MAX;
-static int32_t pres_observed_max = INT32_MIN;
+static lv_obj_t *temp_grid_labels[MAX_GRID_LABELS];
+static lv_obj_t *pres_grid_labels[MAX_GRID_LABELS];
+static int chart_y_pos, chart_h_size;  // stored for label positioning
+static int ha_chart_add_counter = 0;
 
 // Toast auto-clear
 static int64_t toast_show_time = 0;
@@ -441,6 +439,91 @@ static void mc_check_worker(void *pvParameters)
 }
 
 // ---------------------------------------------------------------------
+// Chart grid helpers
+// ---------------------------------------------------------------------
+static int32_t floor_to(int32_t val, int32_t step) {
+    if (val >= 0) return (val / step) * step;
+    return ((val - step + 1) / step) * step;
+}
+
+static int32_t ceil_to(int32_t val, int32_t step) {
+    if (val >= 0) return ((val + step - 1) / step) * step;
+    return (val / step) * step;
+}
+
+static int32_t pick_nice_step(int32_t range, int32_t scale) {
+    static const int mults[] = {1, 2, 5, 10, 20, 50, 100};
+    for (int i = 0; i < 7; i++) {
+        int32_t step = (int32_t)mults[i] * scale;
+        int n = range / step;
+        if (n >= 2 && n <= 8) return step;
+    }
+    return scale;
+}
+
+// Scan chart buffer for current min/max (ignores LV_CHART_POINT_NONE)
+static void chart_min_max(lv_obj_t *chart, lv_chart_series_t *ser,
+                          int32_t *out_min, int32_t *out_max) {
+    int32_t mn = INT32_MAX, mx = INT32_MIN;
+    int32_t *arr = lv_chart_get_y_array(chart, ser);
+    uint32_t cnt = lv_chart_get_point_count(chart);
+    for (uint32_t i = 0; i < cnt; i++) {
+        if (arr[i] == LV_CHART_POINT_NONE) continue;
+        if (arr[i] < mn) mn = arr[i];
+        if (arr[i] > mx) mx = arr[i];
+    }
+    *out_min = mn;
+    *out_max = mx;
+}
+
+// Update chart range to snap to round values, position grid labels
+static void update_chart_grid(lv_obj_t *chart, lv_chart_series_t *ser,
+                              int32_t scale, lv_obj_t *grid_labels[],
+                              int chart_x) {
+    int32_t data_min, data_max;
+    chart_min_max(chart, ser, &data_min, &data_max);
+    if (data_min > data_max) return;  // no valid data
+
+    int32_t raw_range = data_max - data_min;
+    if (raw_range < scale * 2) raw_range = scale * 2;
+
+    int32_t step = pick_nice_step(raw_range, scale);
+    int32_t lo = floor_to(data_min - step / 2, step);
+    int32_t hi = ceil_to(data_max + step / 2, step);
+    while ((hi - lo) / step < 3) hi += step;
+
+    int num_steps = (hi - lo) / step;
+    int num_divs = num_steps - 1;
+    if (num_divs > MAX_GRID_LABELS) num_divs = MAX_GRID_LABELS;
+
+    lv_chart_set_range(chart, LV_CHART_AXIS_PRIMARY_Y, lo, hi);
+    lv_chart_set_div_line_count(chart, num_divs, 3);
+
+    // Position labels at each horizontal grid line
+    int border = 1;
+    int content_top = border + CHART_PAD_V;
+    int content_h = chart_h_size - 2 * (border + CHART_PAD_V);
+
+    for (int i = 0; i < MAX_GRID_LABELS; i++) {
+        if (i < num_divs) {
+            int k = i + 1;
+            int y = content_top + content_h * k / (num_divs + 1) - 7;
+            int32_t val = hi - (int32_t)((int64_t)(hi - lo) * k / (num_divs + 1));
+
+            if (scale == 10)
+                lv_label_set_text_fmt(grid_labels[i], "%"PRId32, val / 10);
+            else
+                lv_label_set_text_fmt(grid_labels[i], "%"PRId32, val / 100);
+
+            lv_obj_set_pos(grid_labels[i], chart_x + 4, chart_y_pos + y);
+            lv_obj_remove_flag(grid_labels[i], LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_add_flag(grid_labels[i], LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
 // Home Assistant Sensor Check
 // ---------------------------------------------------------------------
 static void ha_check_worker(void *pvParameters)
@@ -478,55 +561,19 @@ static void ha_check_worker(void *pvParameters)
         }
     }
 
-    // Update charts with auto-ranging
+    // Throttle chart point addition: every HA_CHART_ADD_EVERY polls (5 min)
+    bool add_point = (++ha_chart_add_counter >= HA_CHART_ADD_EVERY);
+    if (add_point) ha_chart_add_counter = 0;
+
     if (temp_chart && temp_series && temp.ok) {
         int32_t tv = (int32_t)(temp.value * 10);
-        lv_chart_set_next_value(temp_chart, temp_series, tv);
-        if (tv < temp_observed_min) temp_observed_min = tv;
-        if (tv > temp_observed_max) temp_observed_max = tv;
-        // Add padding: 5 units (0.5C) on each side, minimum range of 20 (2C)
-        int32_t range = temp_observed_max - temp_observed_min;
-        if (range < 20) range = 20;
-        int32_t pad = range / 4;
-        if (pad < 5) pad = 5;
-        int32_t lo = temp_observed_min - pad;
-        int32_t hi = temp_observed_max + pad;
-        lv_chart_set_range(temp_chart, LV_CHART_AXIS_PRIMARY_Y, lo, hi);
-        // Update range labels (value/10 with 1 decimal)
-        if (temp_range_min_label) {
-            int lo_i = (int)(lo / 10), lo_d = (int)(lo % 10);
-            if (lo < 0 && lo_d != 0) lo_d = -lo_d;
-            lv_label_set_text_fmt(temp_range_min_label, "%d.%d", lo_i, lo_d < 0 ? -lo_d : lo_d);
-        }
-        if (temp_range_max_label) {
-            int hi_i = (int)(hi / 10), hi_d = (int)(hi % 10);
-            if (hi < 0 && hi_d != 0) hi_d = -hi_d;
-            lv_label_set_text_fmt(temp_range_max_label, "%d.%d", hi_i, hi_d < 0 ? -hi_d : hi_d);
-        }
+        if (add_point) lv_chart_set_next_value(temp_chart, temp_series, tv);
+        update_chart_grid(temp_chart, temp_series, 10, temp_grid_labels, 20);
     }
     if (pres_chart && pres_series && pres.ok) {
         int32_t pv = (int32_t)(pres.value * 100);
-        lv_chart_set_next_value(pres_chart, pres_series, pv);
-        if (pv < pres_observed_min) pres_observed_min = pv;
-        if (pv > pres_observed_max) pres_observed_max = pv;
-        // Add padding: 200 units (2.00 hPa) each side, minimum range of 1000 (10.00 hPa)
-        int32_t range = pres_observed_max - pres_observed_min;
-        if (range < 1000) range = 1000;
-        int32_t pad = range / 4;
-        if (pad < 200) pad = 200;
-        int32_t lo = pres_observed_min - pad;
-        int32_t hi = pres_observed_max + pad;
-        lv_chart_set_range(pres_chart, LV_CHART_AXIS_PRIMARY_Y, lo, hi);
-        if (pres_range_min_label) {
-            int lo_i = (int)(lo / 100), lo_d = (int)(lo % 100);
-            if (lo < 0 && lo_d != 0) lo_d = -lo_d;
-            lv_label_set_text_fmt(pres_range_min_label, "%d.%02d", lo_i, lo_d < 0 ? -lo_d : lo_d);
-        }
-        if (pres_range_max_label) {
-            int hi_i = (int)(hi / 100), hi_d = (int)(hi % 100);
-            if (hi < 0 && hi_d != 0) hi_d = -hi_d;
-            lv_label_set_text_fmt(pres_range_max_label, "%d.%02d", hi_i, hi_d < 0 ? -hi_d : hi_d);
-        }
+        if (add_point) lv_chart_set_next_value(pres_chart, pres_series, pv);
+        update_chart_grid(pres_chart, pres_series, 100, pres_grid_labels, 20 + 330 + 20);
     }
 
     bsp_display_unlock();
@@ -665,6 +712,8 @@ static void create_ui(void)
     int chart_y = values_y + 60;
     int chart_h = 240;
     int chart_w = 330;
+    chart_y_pos = chart_y;
+    chart_h_size = chart_h;
 
     // Temperature chart (left)
     temp_chart = lv_chart_create(scr);
@@ -672,8 +721,12 @@ static void create_ui(void)
     lv_obj_set_size(temp_chart, chart_w, chart_h);
     lv_chart_set_type(temp_chart, LV_CHART_TYPE_LINE);
     lv_chart_set_point_count(temp_chart, HA_CHART_POINTS);
-    lv_chart_set_range(temp_chart, LV_CHART_AXIS_PRIMARY_Y, 100, 400); // 10.0 to 40.0 C (value*10)
-    lv_chart_set_div_line_count(temp_chart, 5, 0);
+    lv_chart_set_range(temp_chart, LV_CHART_AXIS_PRIMARY_Y, 100, 400);
+    lv_chart_set_div_line_count(temp_chart, 5, 3);  // 3 vertical = -12h, -24h, -36h
+    lv_obj_set_style_pad_top(temp_chart, CHART_PAD_V, 0);
+    lv_obj_set_style_pad_bottom(temp_chart, CHART_PAD_V, 0);
+    lv_obj_set_style_pad_left(temp_chart, 2, 0);
+    lv_obj_set_style_pad_right(temp_chart, 2, 0);
     lv_obj_set_style_bg_color(temp_chart, lv_color_hex(0x262626), 0);
     lv_obj_set_style_border_color(temp_chart, lv_color_hex(0x333333), 0);
     lv_obj_set_style_border_width(temp_chart, 1, 0);
@@ -684,27 +737,28 @@ static void create_ui(void)
     lv_obj_set_style_height(temp_chart, 0, LV_PART_INDICATOR);
     temp_series = lv_chart_add_series(temp_chart, lv_color_hex(0xff6d00), LV_CHART_AXIS_PRIMARY_Y);
 
-    // Temperature range labels (top-left and bottom-left of chart)
-    temp_range_max_label = lv_label_create(scr);
-    lv_label_set_text(temp_range_max_label, "");
-    lv_obj_set_style_text_color(temp_range_max_label, lv_color_hex(0x888888), 0);
-    lv_obj_set_style_text_font(temp_range_max_label, &lv_font_montserrat_14, 0);
-    lv_obj_set_pos(temp_range_max_label, 24, chart_y + 2);
-
-    temp_range_min_label = lv_label_create(scr);
-    lv_label_set_text(temp_range_min_label, "");
-    lv_obj_set_style_text_color(temp_range_min_label, lv_color_hex(0x888888), 0);
-    lv_obj_set_style_text_font(temp_range_min_label, &lv_font_montserrat_14, 0);
-    lv_obj_set_pos(temp_range_min_label, 24, chart_y + chart_h - 18);
+    // Temperature grid labels
+    for (int i = 0; i < MAX_GRID_LABELS; i++) {
+        temp_grid_labels[i] = lv_label_create(scr);
+        lv_label_set_text(temp_grid_labels[i], "");
+        lv_obj_set_style_text_color(temp_grid_labels[i], lv_color_hex(0x888888), 0);
+        lv_obj_set_style_text_font(temp_grid_labels[i], &lv_font_montserrat_14, 0);
+        lv_obj_add_flag(temp_grid_labels[i], LV_OBJ_FLAG_HIDDEN);
+    }
 
     // Pressure chart (right)
+    int pres_chart_x = 20 + chart_w + 20;
     pres_chart = lv_chart_create(scr);
-    lv_obj_set_pos(pres_chart, 20 + chart_w + 20, chart_y);
+    lv_obj_set_pos(pres_chart, pres_chart_x, chart_y);
     lv_obj_set_size(pres_chart, chart_w, chart_h);
     lv_chart_set_type(pres_chart, LV_CHART_TYPE_LINE);
     lv_chart_set_point_count(pres_chart, HA_CHART_POINTS);
     lv_chart_set_range(pres_chart, LV_CHART_AXIS_PRIMARY_Y, 94000, 106000);
-    lv_chart_set_div_line_count(pres_chart, 5, 0);
+    lv_chart_set_div_line_count(pres_chart, 5, 3);  // 3 vertical = -12h, -24h, -36h
+    lv_obj_set_style_pad_top(pres_chart, CHART_PAD_V, 0);
+    lv_obj_set_style_pad_bottom(pres_chart, CHART_PAD_V, 0);
+    lv_obj_set_style_pad_left(pres_chart, 2, 0);
+    lv_obj_set_style_pad_right(pres_chart, 2, 0);
     lv_obj_set_style_bg_color(pres_chart, lv_color_hex(0x262626), 0);
     lv_obj_set_style_border_color(pres_chart, lv_color_hex(0x333333), 0);
     lv_obj_set_style_border_width(pres_chart, 1, 0);
@@ -715,19 +769,14 @@ static void create_ui(void)
     lv_obj_set_style_height(pres_chart, 0, LV_PART_INDICATOR);
     pres_series = lv_chart_add_series(pres_chart, lv_color_hex(0x42a5f5), LV_CHART_AXIS_PRIMARY_Y);
 
-    // Pressure range labels
-    int pres_chart_x = 20 + chart_w + 20;
-    pres_range_max_label = lv_label_create(scr);
-    lv_label_set_text(pres_range_max_label, "");
-    lv_obj_set_style_text_color(pres_range_max_label, lv_color_hex(0x888888), 0);
-    lv_obj_set_style_text_font(pres_range_max_label, &lv_font_montserrat_14, 0);
-    lv_obj_set_pos(pres_range_max_label, pres_chart_x + 4, chart_y + 2);
-
-    pres_range_min_label = lv_label_create(scr);
-    lv_label_set_text(pres_range_min_label, "");
-    lv_obj_set_style_text_color(pres_range_min_label, lv_color_hex(0x888888), 0);
-    lv_obj_set_style_text_font(pres_range_min_label, &lv_font_montserrat_14, 0);
-    lv_obj_set_pos(pres_range_min_label, pres_chart_x + 4, chart_y + chart_h - 18);
+    // Pressure grid labels
+    for (int i = 0; i < MAX_GRID_LABELS; i++) {
+        pres_grid_labels[i] = lv_label_create(scr);
+        lv_label_set_text(pres_grid_labels[i], "");
+        lv_obj_set_style_text_color(pres_grid_labels[i], lv_color_hex(0x888888), 0);
+        lv_obj_set_style_text_font(pres_grid_labels[i], &lv_font_montserrat_14, 0);
+        lv_obj_add_flag(pres_grid_labels[i], LV_OBJ_FLAG_HIDDEN);
+    }
 
     // ---- Toast Bar (overlay, hidden by default) ----
     toast_bar = lv_obj_create(scr);
