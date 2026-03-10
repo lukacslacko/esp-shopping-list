@@ -31,8 +31,8 @@ static const char *TAG = "main";
 // ---------------------------------------------------------------------
 // Configuration
 // ---------------------------------------------------------------------
-#define LCD_H_RES       800
-#define LCD_V_RES       800
+#define LCD_H_RES       720
+#define LCD_V_RES       720
 #define SAMPLE_RATE     16000
 #define REC_MAX_SEC     5
 #define REC_BUFFER_SAMPLES (SAMPLE_RATE * REC_MAX_SEC)
@@ -42,17 +42,17 @@ static const char *TAG = "main";
 // Home Assistant BMP280 sensor entity IDs
 #define HA_ENTITY_TEMPERATURE  "sensor.pico_balcony_temperature"
 #define HA_ENTITY_PRESSURE     "sensor.pico_balcony_pressure"
-#define HA_CHECK_INTERVAL_MS   (5 * 60 * 1000)  // 5 minutes
+#define HA_CHECK_INTERVAL_MS   (15 * 1000)  // 15 seconds
 
 // 7-segment clock dimensions
-#define SEG_DW      130   // digit bounding box width
+#define SEG_DW      110   // digit bounding box width
 #define SEG_DH      220   // digit bounding box height
-#define SEG_T       16    // segment thickness
-#define SEG_G       4     // corner gap
+#define SEG_T       22    // segment thickness
+#define SEG_TIP_GAP 2     // gap between adjacent segment tips
 #define CLOCK_DIGITS 4
-#define DIGIT_GAP   14    // gap between digits in a pair
-#define COLON_GAP   24    // gap on each side of colon
-#define COLON_DOT   16    // colon dot size
+#define DIGIT_GAP   45    // gap between digits in a pair
+#define COLON_GAP   34    // gap on each side of colon
+#define COLON_DOT   20    // colon dot size
 
 // 48h chart: 576 points at 5-min intervals
 #define HA_CHART_POINTS 576
@@ -78,9 +78,9 @@ static lv_obj_t *record_btn = NULL;
 static lv_obj_t *record_btn_label = NULL;
 static lv_obj_t *mc_status_label = NULL;
 
-// 7-segment clock
-static lv_obj_t *seg_objs[CLOCK_DIGITS][7];
-static lv_obj_t *colon_dots[2];
+// 7-segment clock (canvas-based with hexagonal segments)
+static lv_obj_t *clock_canvas = NULL;
+static int clock_digit_vals[CLOCK_DIGITS] = {-2, -2, -2, -2};
 // Segment patterns: bits 0-6 = segments a-g
 // a=top, b=top-right, c=bot-right, d=bottom, e=bot-left, f=top-left, g=middle
 static const uint8_t seg_patterns[10] = {
@@ -178,49 +178,147 @@ static void show_toast(const char *text)
 }
 
 // ---------------------------------------------------------------------
-// 7-Segment Display Helpers
+// 7-Segment Display Helpers (canvas-based hexagonal segments)
 // ---------------------------------------------------------------------
-static void create_digit(lv_obj_t *parent, int dx, int dy, int digit_idx)
+// Draw a horizontal hexagonal segment on a canvas layer
+static void draw_hseg(lv_layer_t *layer, int x, int y, int w, int t, lv_color_t color)
 {
-    int hlen = SEG_DW - 2 * SEG_G;
-    int vlen = (SEG_DH - 3 * SEG_T - 4 * SEG_G) / 2;
-    int top_v_y = dy + SEG_T + SEG_G;
-    int mid_y   = dy + SEG_T + SEG_G + vlen + SEG_G;
-    int bot_v_y = mid_y + SEG_T + SEG_G;
-    int bot_y   = bot_v_y + vlen + SEG_G;
+    int ht = t / 2;
+    lv_draw_triangle_dsc_t tri;
+    lv_draw_triangle_dsc_init(&tri);
+    tri.color = color;
+    tri.opa = LV_OPA_COVER;
 
-    // {x, y, w, h} for segments a through g
-    int pos[7][4] = {
-        {dx + SEG_G, dy, hlen, SEG_T},                           // a: top
-        {dx + SEG_DW - SEG_T, top_v_y, SEG_T, vlen},             // b: top-right
-        {dx + SEG_DW - SEG_T, bot_v_y, SEG_T, vlen},             // c: bot-right
-        {dx + SEG_G, bot_y, hlen, SEG_T},                         // d: bottom
-        {dx, bot_v_y, SEG_T, vlen},                                // e: bot-left
-        {dx, top_v_y, SEG_T, vlen},                                // f: top-left
-        {dx + SEG_G, mid_y, hlen, SEG_T},                         // g: middle
-    };
+    // Left point
+    tri.p[0].x = x;        tri.p[0].y = y + ht;
+    tri.p[1].x = x + ht;   tri.p[1].y = y;
+    tri.p[2].x = x + ht;   tri.p[2].y = y + t;
+    lv_draw_triangle(layer, &tri);
 
-    for (int s = 0; s < 7; s++) {
-        lv_obj_t *seg = lv_obj_create(parent);
-        lv_obj_remove_flag(seg, LV_OBJ_FLAG_SCROLLABLE);
-        lv_obj_set_pos(seg, pos[s][0], pos[s][1]);
-        lv_obj_set_size(seg, pos[s][2], pos[s][3]);
-        lv_obj_set_style_radius(seg, 3, 0);
-        lv_obj_set_style_border_width(seg, 0, 0);
-        lv_obj_set_style_bg_color(seg, lv_color_hex(0x1a2a1a), 0);
-        lv_obj_set_style_pad_all(seg, 0, 0);
-        seg_objs[digit_idx][s] = seg;
+    // Center rectangle
+    lv_draw_rect_dsc_t rect;
+    lv_draw_rect_dsc_init(&rect);
+    rect.bg_color = color;
+    rect.bg_opa = LV_OPA_COVER;
+    rect.radius = 0;
+    rect.border_width = 0;
+    lv_area_t area = {x + ht, y, x + w - ht - 1, y + t - 1};
+    lv_draw_rect(layer, &rect, &area);
+
+    // Right point
+    tri.p[0].x = x + w;        tri.p[0].y = y + ht;
+    tri.p[1].x = x + w - ht;   tri.p[1].y = y;
+    tri.p[2].x = x + w - ht;   tri.p[2].y = y + t;
+    lv_draw_triangle(layer, &tri);
+}
+
+// Draw a vertical hexagonal segment on a canvas layer
+static void draw_vseg(lv_layer_t *layer, int x, int y, int w, int h, lv_color_t color)
+{
+    int hw = w / 2;
+    lv_draw_triangle_dsc_t tri;
+    lv_draw_triangle_dsc_init(&tri);
+    tri.color = color;
+    tri.opa = LV_OPA_COVER;
+
+    // Top point
+    tri.p[0].x = x + hw;   tri.p[0].y = y;
+    tri.p[1].x = x;        tri.p[1].y = y + hw;
+    tri.p[2].x = x + w;    tri.p[2].y = y + hw;
+    lv_draw_triangle(layer, &tri);
+
+    // Center rectangle
+    lv_draw_rect_dsc_t rect;
+    lv_draw_rect_dsc_init(&rect);
+    rect.bg_color = color;
+    rect.bg_opa = LV_OPA_COVER;
+    rect.radius = 0;
+    rect.border_width = 0;
+    lv_area_t area = {x, y + hw, x + w - 1, y + h - hw - 1};
+    lv_draw_rect(layer, &rect, &area);
+
+    // Bottom point
+    tri.p[0].x = x + hw;   tri.p[0].y = y + h;
+    tri.p[1].x = x;        tri.p[1].y = y + h - hw;
+    tri.p[2].x = x + w;    tri.p[2].y = y + h - hw;
+    lv_draw_triangle(layer, &tri);
+}
+
+static void draw_clock(void)
+{
+    if (!clock_canvas) return;
+
+    lv_canvas_fill_bg(clock_canvas, lv_color_hex(0x1a1a1a), LV_OPA_COVER);
+
+    lv_layer_t layer;
+    lv_canvas_init_layer(clock_canvas, &layer);
+
+    // Compute digit x positions (with padding for outward-shifted vertical bars)
+    int ht = SEG_T / 2;
+    int pad = ht;  // left/right padding for outward-shifted verticals
+    int d_x[4];
+    d_x[0] = pad;
+    d_x[1] = pad + SEG_DW + DIGIT_GAP;
+    int colon_x = d_x[1] + SEG_DW + COLON_GAP;
+    d_x[2] = colon_x + COLON_DOT + COLON_GAP;
+    d_x[3] = d_x[2] + SEG_DW + DIGIT_GAP;
+
+    // Segment geometry: vertical bars span from midpoint of one
+    // horizontal bar to midpoint of the next, shifted outward by ht
+    int vsec = (SEG_DH - 3 * SEG_T) / 2;  // vertical section between bars
+    int mid_y = SEG_T + vsec;               // middle horizontal bar y
+    int bot_y = SEG_DH - SEG_T;             // bottom horizontal bar y
+    int vbar_h = vsec + SEG_T - 2 * SEG_TIP_GAP;  // midpoint-to-midpoint minus tip gaps
+    int top_vy = ht + SEG_TIP_GAP;          // top verticals start just below top bar midpoint
+    int bot_vy = mid_y + ht + SEG_TIP_GAP;  // bottom verticals start just below mid bar midpoint
+
+    for (int d = 0; d < CLOCK_DIGITS; d++) {
+        int dx = d_x[d];
+        int value = clock_digit_vals[d];
+        uint8_t pat = (value >= 0 && value <= 9) ? seg_patterns[value] : 0x40;
+
+        struct { int x, y, w, h; bool horiz; } segs[7] = {
+            {dx,                 0,      SEG_DW, SEG_T,  true},    // a: top
+            {dx + SEG_DW - ht,  top_vy, SEG_T,  vbar_h, false},   // b: top-right
+            {dx + SEG_DW - ht,  bot_vy, SEG_T,  vbar_h, false},   // c: bot-right
+            {dx,                 bot_y,  SEG_DW, SEG_T,  true},    // d: bottom
+            {dx - ht,           bot_vy, SEG_T,  vbar_h, false},   // e: bot-left
+            {dx - ht,           top_vy, SEG_T,  vbar_h, false},   // f: top-left
+            {dx,                 mid_y,  SEG_DW, SEG_T,  true},    // g: middle
+        };
+
+        for (int s = 0; s < 7; s++) {
+            bool on = (pat >> s) & 1;
+            lv_color_t color = lv_color_hex(on ? 0x00e676 : 0x1a2a1a);
+            if (segs[s].horiz) {
+                draw_hseg(&layer, segs[s].x, segs[s].y, segs[s].w, segs[s].h, color);
+            } else {
+                draw_vseg(&layer, segs[s].x, segs[s].y, segs[s].w, segs[s].h, color);
+            }
+        }
     }
+
+    // Draw colon dots
+    lv_draw_rect_dsc_t dot_dsc;
+    lv_draw_rect_dsc_init(&dot_dsc);
+    dot_dsc.bg_color = lv_color_hex(0x00e676);
+    dot_dsc.bg_opa = LV_OPA_COVER;
+    dot_dsc.radius = LV_RADIUS_CIRCLE;
+    dot_dsc.border_width = 0;
+
+    int dot_y1 = SEG_DH / 3 - COLON_DOT / 2;
+    int dot_y2 = 2 * SEG_DH / 3 - COLON_DOT / 2;
+    lv_area_t dot1 = {colon_x, dot_y1, colon_x + COLON_DOT - 1, dot_y1 + COLON_DOT - 1};
+    lv_area_t dot2 = {colon_x, dot_y2, colon_x + COLON_DOT - 1, dot_y2 + COLON_DOT - 1};
+    lv_draw_rect(&layer, &dot_dsc, &dot1);
+    lv_draw_rect(&layer, &dot_dsc, &dot2);
+
+    lv_canvas_finish_layer(clock_canvas, &layer);
 }
 
 static void set_digit(int digit_idx, int value)
 {
-    uint8_t pat = (value >= 0 && value <= 9) ? seg_patterns[value] : 0x40; // 0x40 = dash (g only)
-    for (int s = 0; s < 7; s++) {
-        bool on = (pat >> s) & 1;
-        lv_obj_set_style_bg_color(seg_objs[digit_idx][s],
-            lv_color_hex(on ? 0x00e676 : 0x1a2a1a), 0);
-    }
+    clock_digit_vals[digit_idx] = value;
 }
 
 // ---------------------------------------------------------------------
@@ -369,10 +467,13 @@ static void ha_check_worker(void *pvParameters)
     // Update pressure label
     if (pres_value_label) {
         if (pres.ok) {
-            lv_label_set_text_fmt(pres_value_label, "%d hPa", (int)pres.value);
+            int p_int = (int)pres.value;
+            int p_dec = ((int)(pres.value * 100)) % 100;
+            if (p_dec < 0) p_dec = -p_dec;
+            lv_label_set_text_fmt(pres_value_label, "%d.%02d hPa", p_int, p_dec);
             lv_obj_set_style_text_color(pres_value_label, lv_color_hex(0x42a5f5), 0);
         } else {
-            lv_label_set_text(pres_value_label, "--- hPa");
+            lv_label_set_text(pres_value_label, "---.-- hPa");
             lv_obj_set_style_text_color(pres_value_label, lv_color_hex(0x555555), 0);
         }
     }
@@ -404,22 +505,28 @@ static void ha_check_worker(void *pvParameters)
         }
     }
     if (pres_chart && pres_series && pres.ok) {
-        int32_t pv = (int32_t)pres.value;
+        int32_t pv = (int32_t)(pres.value * 100);
         lv_chart_set_next_value(pres_chart, pres_series, pv);
         if (pv < pres_observed_min) pres_observed_min = pv;
         if (pv > pres_observed_max) pres_observed_max = pv;
-        // Add padding: 2 hPa each side, minimum range of 10 hPa
+        // Add padding: 200 units (2.00 hPa) each side, minimum range of 1000 (10.00 hPa)
         int32_t range = pres_observed_max - pres_observed_min;
-        if (range < 10) range = 10;
+        if (range < 1000) range = 1000;
         int32_t pad = range / 4;
-        if (pad < 2) pad = 2;
+        if (pad < 200) pad = 200;
         int32_t lo = pres_observed_min - pad;
         int32_t hi = pres_observed_max + pad;
         lv_chart_set_range(pres_chart, LV_CHART_AXIS_PRIMARY_Y, lo, hi);
-        if (pres_range_min_label)
-            lv_label_set_text_fmt(pres_range_min_label, "%d", (int)lo);
-        if (pres_range_max_label)
-            lv_label_set_text_fmt(pres_range_max_label, "%d", (int)hi);
+        if (pres_range_min_label) {
+            int lo_i = (int)(lo / 100), lo_d = (int)(lo % 100);
+            if (lo < 0 && lo_d != 0) lo_d = -lo_d;
+            lv_label_set_text_fmt(pres_range_min_label, "%d.%02d", lo_i, lo_d < 0 ? -lo_d : lo_d);
+        }
+        if (pres_range_max_label) {
+            int hi_i = (int)(hi / 100), hi_d = (int)(hi % 100);
+            if (hi < 0 && hi_d != 0) hi_d = -hi_d;
+            lv_label_set_text_fmt(pres_range_max_label, "%d.%02d", hi_i, hi_d < 0 ? -hi_d : hi_d);
+        }
     }
 
     bsp_display_unlock();
@@ -449,11 +556,13 @@ static void update_time_cb(lv_timer_t *timer)
             set_digit(1, timeinfo.tm_hour % 10);
             set_digit(2, timeinfo.tm_min / 10);
             set_digit(3, timeinfo.tm_min % 10);
+            draw_clock();
         }
     } else if (last_displayed_minute != -2) {
         // Show dashes when time not synced
         last_displayed_minute = -2;
         for (int d = 0; d < CLOCK_DIGITS; d++) set_digit(d, -1);
+        draw_clock();
     }
 
     if (wifi_indicator) {
@@ -475,7 +584,7 @@ static void update_time_cb(lv_timer_t *timer)
         bool should_dim = (timeinfo.tm_hour >= 21 || timeinfo.tm_hour < 7);
         if (should_dim != night_mode_active) {
             night_mode_active = should_dim;
-            bsp_display_brightness_set(should_dim ? 10 : 100);
+            bsp_display_brightness_set(should_dim ? 0 : 100);
         }
     }
 
@@ -514,50 +623,26 @@ static void create_ui(void)
     mc_status_label = lv_label_create(scr);
     lv_label_set_text(mc_status_label, "MC: ...");
     lv_obj_set_style_text_color(mc_status_label, lv_color_hex(0x888888), 0);
-    lv_obj_set_style_text_font(mc_status_label, &lv_font_montserrat_18, 0);
-    lv_obj_align(mc_status_label, LV_ALIGN_TOP_RIGHT, -16, 12);
+    lv_obj_set_style_text_font(mc_status_label, &lv_font_montserrat_28, 0);
+    lv_obj_align(mc_status_label, LV_ALIGN_TOP_RIGHT, -16, 10);
 
-    // ---- 7-Segment Clock ----
-    // Digit positions within clock container
-    int d_x[4];
-    d_x[0] = 0;
-    d_x[1] = SEG_DW + DIGIT_GAP;
-    int colon_x = d_x[1] + SEG_DW + COLON_GAP;
-    d_x[2] = colon_x + COLON_DOT + COLON_GAP;
-    d_x[3] = d_x[2] + SEG_DW + DIGIT_GAP;
-    int clock_w = d_x[3] + SEG_DW;
+    // ---- 7-Segment Clock (canvas) ----
+    int ht = SEG_T / 2;
+    int pad = ht;  // padding for outward-shifted vertical bars
+    int clock_w = pad + SEG_DW + DIGIT_GAP + SEG_DW + COLON_GAP
+                + COLON_DOT + COLON_GAP + SEG_DW + DIGIT_GAP + SEG_DW + pad;
     int clock_x = (LCD_H_RES - clock_w) / 2;
     int clock_y = 40;
 
-    // Create clock container
-    lv_obj_t *clock_cont = lv_obj_create(scr);
-    lv_obj_remove_flag(clock_cont, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_size(clock_cont, clock_w, SEG_DH);
-    lv_obj_set_pos(clock_cont, clock_x, clock_y);
-    lv_obj_set_style_bg_opa(clock_cont, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_width(clock_cont, 0, 0);
-    lv_obj_set_style_pad_all(clock_cont, 0, 0);
+    clock_canvas = lv_canvas_create(scr);
+    uint32_t canvas_buf_size = LV_CANVAS_BUF_SIZE(clock_w, SEG_DH, 32, LV_DRAW_BUF_STRIDE_ALIGN);
+    void *canvas_buf = heap_caps_malloc(canvas_buf_size, MALLOC_CAP_SPIRAM);
+    lv_canvas_set_buffer(clock_canvas, canvas_buf, clock_w, SEG_DH, LV_COLOR_FORMAT_ARGB8888);
+    lv_obj_set_pos(clock_canvas, clock_x, clock_y);
 
-    for (int d = 0; d < CLOCK_DIGITS; d++) {
-        create_digit(clock_cont, d_x[d], 0, d);
-    }
-
-    // Colon dots
-    int colon_cx = colon_x + COLON_DOT / 2 - COLON_DOT / 2;
-    for (int i = 0; i < 2; i++) {
-        colon_dots[i] = lv_obj_create(clock_cont);
-        lv_obj_remove_flag(colon_dots[i], LV_OBJ_FLAG_SCROLLABLE);
-        int dot_y = (i == 0) ? (SEG_DH / 3 - COLON_DOT / 2) : (2 * SEG_DH / 3 - COLON_DOT / 2);
-        lv_obj_set_pos(colon_dots[i], colon_cx, dot_y);
-        lv_obj_set_size(colon_dots[i], COLON_DOT, COLON_DOT);
-        lv_obj_set_style_radius(colon_dots[i], LV_RADIUS_CIRCLE, 0);
-        lv_obj_set_style_bg_color(colon_dots[i], lv_color_hex(0x00e676), 0);
-        lv_obj_set_style_border_width(colon_dots[i], 0, 0);
-        lv_obj_set_style_pad_all(colon_dots[i], 0, 0);
-    }
-
-    // Initialize digits to dashes
+    // Initialize digits to dashes and draw
     for (int d = 0; d < CLOCK_DIGITS; d++) set_digit(d, -1);
+    draw_clock();
 
     // ---- Sensor Values (below clock) ----
     int values_y = clock_y + SEG_DH + 15;
@@ -579,7 +664,7 @@ static void create_ui(void)
     // ---- 48h Charts ----
     int chart_y = values_y + 60;
     int chart_h = 240;
-    int chart_w = 360;
+    int chart_w = 330;
 
     // Temperature chart (left)
     temp_chart = lv_chart_create(scr);
@@ -618,7 +703,7 @@ static void create_ui(void)
     lv_obj_set_size(pres_chart, chart_w, chart_h);
     lv_chart_set_type(pres_chart, LV_CHART_TYPE_LINE);
     lv_chart_set_point_count(pres_chart, HA_CHART_POINTS);
-    lv_chart_set_range(pres_chart, LV_CHART_AXIS_PRIMARY_Y, 940, 1060);
+    lv_chart_set_range(pres_chart, LV_CHART_AXIS_PRIMARY_Y, 94000, 106000);
     lv_chart_set_div_line_count(pres_chart, 5, 0);
     lv_obj_set_style_bg_color(pres_chart, lv_color_hex(0x262626), 0);
     lv_obj_set_style_border_color(pres_chart, lv_color_hex(0x333333), 0);
