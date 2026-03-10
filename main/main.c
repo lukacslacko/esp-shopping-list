@@ -43,7 +43,7 @@ static const char *TAG = "main";
 // Home Assistant BMP280 sensor entity IDs
 #define HA_ENTITY_TEMPERATURE  "sensor.pico_balcony_temperature"
 #define HA_ENTITY_PRESSURE     "sensor.pico_balcony_pressure"
-#define HA_CHECK_INTERVAL_MS   (15 * 1000)  // 15 seconds
+#define HA_CHECK_INTERVAL_MS   (60 * 1000)  // 60 seconds
 
 // 7-segment clock dimensions
 #define SEG_DW      110   // digit bounding box width
@@ -57,7 +57,7 @@ static const char *TAG = "main";
 
 // 48h chart: 576 points at 5-min intervals
 #define HA_CHART_POINTS 576
-#define HA_CHART_ADD_EVERY 20   // add chart point every 20 polls (20*15s = 5min)
+#define HA_CHART_ADD_EVERY 5    // add chart point every 5 polls (5*60s = 5min)
 #define MAX_GRID_LABELS 10      // max horizontal grid line labels per chart
 #define CHART_PAD_V 10          // explicit vertical padding inside chart
 
@@ -539,10 +539,10 @@ static void ha_check_worker(void *pvParameters)
             int t_int = (int)temp.value;
             int t_dec = ((int)(temp.value * 10)) % 10;
             if (t_dec < 0) t_dec = -t_dec;
-            lv_label_set_text_fmt(temp_value_label, "%d.%dC", t_int, t_dec);
+            lv_label_set_text_fmt(temp_value_label, "%d.%d C", t_int, t_dec);
             lv_obj_set_style_text_color(temp_value_label, lv_color_hex(0xff6d00), 0);
         } else {
-            lv_label_set_text(temp_value_label, "--.-C");
+            lv_label_set_text(temp_value_label, "--.- C");
             lv_obj_set_style_text_color(temp_value_label, lv_color_hex(0x555555), 0);
         }
     }
@@ -631,7 +631,7 @@ static void update_time_cb(lv_timer_t *timer)
         bool should_dim = (timeinfo.tm_hour >= 21 || timeinfo.tm_hour < 7);
         if (should_dim != night_mode_active) {
             night_mode_active = should_dim;
-            bsp_display_brightness_set(should_dim ? 0 : 100);
+            bsp_display_brightness_set(should_dim ? 5 : 50);
         }
     }
 
@@ -837,7 +837,7 @@ void app_main(void)
     // 2. Display
     ESP_LOGI(TAG, "Initializing display...");
     bsp_display_start();
-    bsp_display_backlight_on();
+    bsp_display_brightness_set(50);
     ESP_LOGI(TAG, "Display initialized");
 
     // Rotate 90 CW to compensate for physically rotated unit
